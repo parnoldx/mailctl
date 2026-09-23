@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"mime"
 	"mime/quotedprintable"
@@ -15,12 +16,14 @@ import (
 	netmail "net/mail"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/emersion/go-message/charset" // also registers iso-8859-*, windows-125x, etc. for mail.CreateReader
 	"github.com/emersion/go-message/mail"
 	"github.com/emersion/go-sasl"
 	gosmtp "github.com/emersion/go-smtp"
@@ -152,7 +155,6 @@ func (m imapMailbox) List(opts ListOpts) ([]Msg, error) {
 		Flags:         true,
 		InternalDate:  true,
 		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
-		BodySection:   []*imap.FetchItemBodySection{{Peek: true, Part: []int{1}}},
 	})
 	buffs, err := fetch.Collect()
 	if err != nil {
@@ -165,6 +167,7 @@ func (m imapMailbox) List(opts ListOpts) ([]Msg, error) {
 	}
 
 	out := make([]Msg, 0, len(buffs))
+	texts := map[imap.UID]textRef{}
 	for _, u := range nums {
 		buf := byUID[u]
 		if buf == nil {
@@ -189,18 +192,110 @@ func (m imapMailbox) List(opts ListOpts) ([]Msg, error) {
 		}
 		msg.Unread = !hasFlag(buf.Flags, imap.FlagSeen)
 		msg.HasAttachments = hasAttachments(buf.BodyStructure)
-		// Part 1 is the plain text body for typical messages; decode its
-		// transfer encoding and collapse whitespace for the snippet.
-		if len(buf.BodySection) > 0 {
-			enc := ""
-			if sp, ok := partOne(buf.BodyStructure).(*imap.BodyStructureSinglePart); ok {
-				enc = sp.Encoding
-			}
-			msg.Snippet = snippet(string(decodeTransfer(buf.BodySection[0].Bytes, enc)), 200)
+		if path, sp := textPart(buf.BodyStructure); sp != nil {
+			texts[buf.UID] = textRef{idx: len(out), path: path, sp: sp}
 		}
 		out = append(out, msg)
 	}
+	if err := fetchSnippets(c, texts, out); err != nil {
+		return nil, fmt.Errorf("imap fetch %s: %w", folder, err)
+	}
 	return out, nil
+}
+
+// textRef points at the part of a listed message that its snippet comes from.
+type textRef struct {
+	idx  int
+	path []int
+	sp   *imap.BodyStructureSinglePart
+}
+
+// fetchSnippets fetches the first 8 KB of each message's text part, one FETCH
+// per distinct part path (in practice "1", "1.1", ...), and fills Snippet.
+func fetchSnippets(c *imapclient.Client, texts map[imap.UID]textRef, out []Msg) error {
+	sets := map[string]*imap.UIDSet{}
+	paths := map[string][]int{}
+	for uid, t := range texts {
+		k := fmt.Sprint(t.path)
+		if sets[k] == nil {
+			sets[k], paths[k] = &imap.UIDSet{}, t.path
+		}
+		sets[k].AddNum(uid)
+	}
+	for k, set := range sets {
+		sec := &imap.FetchItemBodySection{Peek: true, Part: paths[k], Partial: &imap.SectionPartial{Size: 8192}}
+		buffs, err := c.Fetch(*set, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{sec}}).Collect()
+		if err != nil {
+			return err
+		}
+		for _, b := range buffs {
+			t, ok := texts[b.UID]
+			if !ok || len(b.BodySection) == 0 {
+				continue
+			}
+			s := decodeCharset(decodeTransfer(b.BodySection[0].Bytes, t.sp.Encoding), t.sp.Params["charset"])
+			if strings.EqualFold(t.sp.Subtype, "html") {
+				s = stripHTML(s)
+			}
+			out[t.idx].Snippet = snippet(s, 200)
+		}
+	}
+	return nil
+}
+
+// textPart returns the first non-attachment text/plain part, else the first
+// text/html one.
+func textPart(bs imap.BodyStructure) ([]int, *imap.BodyStructureSinglePart) {
+	if bs == nil {
+		return nil, nil
+	}
+	var htmlPath []int
+	var plainPath []int
+	var html, plain *imap.BodyStructureSinglePart
+	bs.Walk(func(path []int, part imap.BodyStructure) bool {
+		sp, ok := part.(*imap.BodyStructureSinglePart)
+		if !ok || !strings.EqualFold(sp.Type, "text") {
+			return true
+		}
+		if d := sp.Disposition(); d != nil && strings.EqualFold(d.Value, "attachment") {
+			return true
+		}
+		switch {
+		case strings.EqualFold(sp.Subtype, "plain") && plain == nil:
+			plain, plainPath = sp, append([]int(nil), path...)
+		case strings.EqualFold(sp.Subtype, "html") && html == nil:
+			html, htmlPath = sp, append([]int(nil), path...)
+		}
+		return plain == nil
+	})
+	if plain != nil {
+		return plainPath, plain
+	}
+	return htmlPath, html
+}
+
+var (
+	reHTMLBlock = regexp.MustCompile(`(?is)<(style|script|head)\b.*?(</(style|script|head)>|$)`)
+	reHTMLTag   = regexp.MustCompile(`(?s)<[^>]*>`)
+)
+
+// stripHTML turns an HTML fragment into rough text for a snippet.
+// ponytail: regexp, not a parser; fine for 200-char previews, use x/net/html if snippets need to be exact.
+func stripHTML(s string) string {
+	return html.UnescapeString(reHTMLTag.ReplaceAllString(reHTMLBlock.ReplaceAllString(s, " "), " "))
+}
+
+// decodeCharset converts to UTF-8; unknown charsets are returned unchanged.
+func decodeCharset(b []byte, cs string) string {
+	if cs == "" || strings.EqualFold(cs, "utf-8") || strings.EqualFold(cs, "us-ascii") {
+		return string(b)
+	}
+	r, err := charset.Reader(cs, bytes.NewReader(b))
+	if err != nil {
+		return string(b)
+	}
+	out, _ := io.ReadAll(r) // keep what decoded; the partial fetch may cut the last char
+	return string(out)
 }
 
 func hasFlag(flags []imap.Flag, want imap.Flag) bool {
@@ -210,19 +305,6 @@ func hasFlag(flags []imap.Flag, want imap.Flag) bool {
 		}
 	}
 	return false
-}
-
-// partOne returns the body structure child for part 1 (nil if absent).
-func partOne(bs imap.BodyStructure) imap.BodyStructure {
-	switch bs := bs.(type) {
-	case *imap.BodyStructureSinglePart:
-		return bs
-	case *imap.BodyStructureMultiPart:
-		if len(bs.Children) > 0 {
-			return bs.Children[0]
-		}
-	}
-	return nil
 }
 
 // hasAttachments reports whether any part looks like an attachment.
@@ -263,16 +345,14 @@ func decodeTransfer(b []byte, enc string) []byte {
 			}
 			return r
 		}, string(b))
+		clean = clean[:len(clean)-len(clean)%4] // partial fetches cut mid-quad
 		out, err := base64.StdEncoding.DecodeString(clean)
 		if err != nil {
 			return b
 		}
 		return out
 	case "quoted-printable":
-		out, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(b)))
-		if err != nil {
-			return b
-		}
+		out, _ := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(b))) // keep what decoded before a cut escape
 		return out
 	}
 	return b

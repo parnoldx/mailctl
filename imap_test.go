@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -433,5 +434,30 @@ func TestIDRoundTrip(t *testing.T) {
 	}
 	if _, err := parseID("nonsense"); err == nil {
 		t.Fatal("expected error for malformed id")
+	}
+}
+
+func TestSnippetHelpers(t *testing.T) {
+	// multipart/mixed > multipart/alternative > (text/plain, text/html): plain wins, path 1.1.
+	bs := &imap.BodyStructureMultiPart{Subtype: "mixed", Children: []imap.BodyStructure{
+		&imap.BodyStructureMultiPart{Subtype: "alternative", Children: []imap.BodyStructure{
+			&imap.BodyStructureSinglePart{Type: "text", Subtype: "html"},
+			&imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"},
+		}},
+	}}
+	if path, sp := textPart(bs); sp == nil || sp.Subtype != "plain" || fmt.Sprint(path) != "[1 2]" {
+		t.Errorf("textPart = %v %v", path, sp)
+	}
+	if got := snippet(stripHTML(`<html><head><style>p{}</style></head><body><p>Hi &amp; bye</p>`), 50); got != "Hi & bye" {
+		t.Errorf("stripHTML = %q", got)
+	}
+	if got := snippet(stripHTML(`<style>.a{color:red} .b{`), 50); got != "" { // style cut by partial fetch
+		t.Errorf("unclosed style = %q", got)
+	}
+	if got := string(decodeTransfer([]byte("SGFsbG8gV2VsdA=="[:14]), "base64")); got != "Hallo Wel" { // cut mid-quad
+		t.Errorf("base64 partial = %q", got)
+	}
+	if got := decodeCharset([]byte{'s', 0xfc, 0xdf}, "iso-8859-1"); got != "süß" {
+		t.Errorf("charset = %q", got)
 	}
 }
