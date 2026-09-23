@@ -242,6 +242,24 @@ func TestGetAndMark(t *testing.T) {
 	if !strings.Contains(full.Text, "Please find the report attached.") {
 		t.Errorf("text = %q", full.Text)
 	}
+	if full.Msg.From != "bob@example.org" {
+		t.Errorf("from = %q", full.Msg.From)
+	}
+	if len(full.Msg.To) != 1 || full.Msg.To[0] != testUser {
+		t.Errorf("to = %v", full.Msg.To)
+	}
+	if full.Msg.Date.IsZero() {
+		t.Error("date not set")
+	}
+	if full.Msg.Subject != "Report" {
+		t.Errorf("subject = %q", full.Msg.Subject)
+	}
+	if !full.Msg.Unread {
+		t.Error("unread not set")
+	}
+	if !full.Msg.HasAttachments {
+		t.Error("has_attachments not set")
+	}
 	if len(full.Attachments) != 1 {
 		t.Fatalf("want 1 attachment, got %d", len(full.Attachments))
 	}

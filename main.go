@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	netmail "net/mail"
 	"os"
 	"strings"
 	"time"
@@ -75,6 +76,33 @@ func fail(code int, format string, args ...any) {
 
 func usageFail(format string, args ...any) { fail(2, format, args...) }
 
+// parseFlags parses args on fs, discarding Go's usage text (stderr must stay
+// JSON-only) and returning a usage error that lists the valid flags.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		var names []string
+		fs.VisitAll(func(f *flag.Flag) { names = append(names, "--"+f.Name) })
+		return &usageError{fmt.Errorf("%v (flags: %s)", err, strings.Join(names, " "))}
+	}
+	return nil
+}
+
+// normalizeAddrs validates addresses at the CLI boundary and strips any
+// display name, so both backends get plain addresses (SMTP RCPT fails on
+// "Name <a@b>").
+func normalizeAddrs(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	for _, a := range in {
+		p, err := netmail.ParseAddress(a)
+		if err != nil {
+			return nil, &usageError{fmt.Errorf("invalid address %q: %v", a, err)}
+		}
+		out = append(out, p.Address)
+	}
+	return out, nil
+}
+
 func printJSON(v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -83,7 +111,7 @@ func printJSON(v any) {
 	fmt.Println(string(b))
 }
 
-// reorderArgs moves positional args to the front so flag.Parse sees flags
+// reorderArgs moves positional args to the end so flag.Parse sees flags
 // after the positional id (e.g. "get 42 --account x").
 func reorderArgs(args []string) []string {
 	boolFlags := map[string]bool{"unread": true, "read": true, "html": true}
@@ -105,7 +133,7 @@ func reorderArgs(args []string) []string {
 			pos = append(pos, a)
 		}
 	}
-	return append(pos, rest...)
+	return append(rest, pos...)
 }
 
 // selectAccount loads the config and picks the named account, or the only one.
@@ -142,8 +170,8 @@ func open(a Account) (Mailbox, error) {
 func cmdAccounts(args []string) error {
 	fs := flag.NewFlagSet("accounts", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to config file")
-	if err := fs.Parse(args); err != nil {
-		return &usageError{err}
+	if err := parseFlags(fs, args); err != nil {
+		return err
 	}
 	accounts, err := loadConfig(configPath(*cfgPath))
 	if err != nil {
@@ -171,8 +199,8 @@ func cmdList(args []string) error {
 	unread := fs.Bool("unread", false, "only unread messages")
 	since := fs.String("since", "", "only messages since YYYY-MM-DD")
 	limit := fs.Int("limit", 50, "maximum number of messages")
-	if err := fs.Parse(args); err != nil {
-		return &usageError{err}
+	if err := parseFlags(fs, args); err != nil {
+		return err
 	}
 	a, err := selectAccount(configPath(*cfgPath), *account)
 	if err != nil {
@@ -206,8 +234,8 @@ func cmdGet(args []string) error {
 	cfgPath := fs.String("config", "", "path to config file")
 	account := fs.String("account", "", "account name")
 	saveDir := fs.String("save-attachments", "", "directory to save attachments to")
-	if err := fs.Parse(args); err != nil {
-		return &usageError{err}
+	if err := parseFlags(fs, args); err != nil {
+		return err
 	}
 	if fs.NArg() != 1 {
 		return &usageError{fmt.Errorf("usage: mailctl get <id> [--account NAME] [--save-attachments DIR]")}
@@ -240,14 +268,21 @@ func cmdSend(args []string) error {
 	html := fs.Bool("html", false, "body is HTML")
 	fs.Var(&attach, "attach", "file to attach (repeatable)")
 	replyTo := fs.String("reply-to", "", "message id to reply to")
-	if err := fs.Parse(args); err != nil {
-		return &usageError{err}
+	if err := parseFlags(fs, args); err != nil {
+		return err
 	}
 	if len(to) == 0 && *replyTo == "" {
 		return &usageError{fmt.Errorf("--to is required unless --reply-to is set")}
 	}
 	if *subject == "" && *replyTo == "" {
 		return &usageError{fmt.Errorf("--subject is required unless --reply-to is set")}
+	}
+	var err error
+	if to, err = normalizeAddrs(to); err != nil {
+		return err
+	}
+	if cc, err = normalizeAddrs(cc); err != nil {
+		return err
 	}
 	body := ""
 	if *bodyFile != "" {
@@ -287,8 +322,8 @@ func cmdMark(args []string) error {
 	account := fs.String("account", "", "account name")
 	read := fs.Bool("read", false, "mark as read")
 	unread := fs.Bool("unread", false, "mark as unread")
-	if err := fs.Parse(args); err != nil {
-		return &usageError{err}
+	if err := parseFlags(fs, args); err != nil {
+		return err
 	}
 	if *read == *unread {
 		return &usageError{fmt.Errorf("exactly one of --read or --unread is required")}
@@ -316,8 +351,8 @@ func cmdMove(args []string) error {
 	cfgPath := fs.String("config", "", "path to config file")
 	account := fs.String("account", "", "account name")
 	to := fs.String("to", "", "destination folder")
-	if err := fs.Parse(args); err != nil {
-		return &usageError{err}
+	if err := parseFlags(fs, args); err != nil {
+		return err
 	}
 	if *to == "" {
 		return &usageError{fmt.Errorf("--to FOLDER is required")}

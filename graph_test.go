@@ -59,6 +59,20 @@ func checkBearer(t *testing.T, r *http.Request) {
 	}
 }
 
+// rejectInefficientFilter mimics Graph's InefficientFilter: when $orderby is
+// receivedDateTime, any $filter must start with receivedDateTime.
+func rejectInefficientFilter(t *testing.T, w http.ResponseWriter, r *http.Request) bool {
+	t.Helper()
+	f := r.URL.Query().Get("$filter")
+	if f == "" || strings.HasPrefix(strings.ToLower(f), "receiveddatetime") {
+		return false
+	}
+	writeJSON(t, w, 400, map[string]any{"error": map[string]string{
+		"code": "InefficientFilter", "message": "the filter must start with the orderby property",
+	}})
+	return true
+}
+
 func TestGraphTokenForm(t *testing.T) {
 	var form url.Values
 	setupGraph(t, http.NewServeMux(), &form)
@@ -80,6 +94,9 @@ func TestGraphList(t *testing.T) {
 	var gotQ url.Values
 	mux.HandleFunc("GET /v1.0/users/"+url.PathEscape(testMailbox)+"/mailFolders/inbox/messages", func(w http.ResponseWriter, r *http.Request) {
 		checkBearer(t, r)
+		if rejectInefficientFilter(t, w, r) {
+			return
+		}
 		gotQ = r.URL.Query()
 		writeJSON(t, w, 200, map[string]any{"value": []map[string]any{{
 			"id": "M1", "subject": "Hi", "receivedDateTime": "2026-09-01T10:00:00Z",
@@ -100,7 +117,7 @@ func TestGraphList(t *testing.T) {
 	if got := gotQ.Get("$orderby"); got != "receivedDateTime desc" {
 		t.Errorf("$orderby = %q", got)
 	}
-	if got := gotQ.Get("$filter"); got != "isRead eq false and receivedDateTime ge 2026-08-01T00:00:00Z" {
+	if got := gotQ.Get("$filter"); got != "receivedDateTime ge 2026-08-01T00:00:00Z and isRead eq false" {
 		t.Errorf("$filter = %q", got)
 	}
 	if !strings.Contains(gotQ.Get("$select"), "bodyPreview") {
@@ -116,6 +133,23 @@ func TestGraphList(t *testing.T) {
 	}
 	if m.Date.UTC() != time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC) {
 		t.Errorf("date = %v", m.Date)
+	}
+}
+
+func TestGraphListUnreadOnly(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1.0/users/"+url.PathEscape(testMailbox)+"/mailFolders/inbox/messages", func(w http.ResponseWriter, r *http.Request) {
+		if rejectInefficientFilter(t, w, r) {
+			return
+		}
+		if got := r.URL.Query().Get("$filter"); got != "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false" {
+			t.Errorf("$filter = %q", got)
+		}
+		writeJSON(t, w, 200, map[string]any{"value": []any{}})
+	})
+	g := setupGraph(t, mux, nil)
+	if _, err := g.List(ListOpts{Unread: true}); err != nil {
+		t.Fatalf("List unread-only: %v", err)
 	}
 }
 
@@ -364,7 +398,7 @@ func TestGraphSendReply(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 	body := patch["body"].(map[string]any)
-	if body["content"] != "my reply\nquoted original\n" {
+	if body["content"] != "my reply\n\nquoted original\n" {
 		t.Errorf("patched body = %q", body["content"])
 	}
 	if _, ok := patch["subject"]; ok {
@@ -373,6 +407,34 @@ func TestGraphSendReply(t *testing.T) {
 	tos := patch["toRecipients"].([]any)
 	if tos[0].(map[string]any)["emailAddress"].(map[string]any)["address"] != "new@to.z" {
 		t.Errorf("toRecipients = %v", patch["toRecipients"])
+	}
+}
+
+func TestGraphSendReplyHTML(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1.0/users/"+url.PathEscape(testMailbox)+"/messages/MSG1/createReply", func(w http.ResponseWriter, r *http.Request) {
+		checkBearer(t, r)
+		writeJSON(t, w, 201, map[string]any{"id": "D1", "body": map[string]any{
+			"contentType": "HTML", "content": "<html><head></head><body><div>orig</div></body></html>",
+		}})
+	})
+	var patch map[string]any
+	mux.HandleFunc("PATCH /v1.0/users/"+url.PathEscape(testMailbox)+"/messages/D1", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+			t.Errorf("decode patch: %v", err)
+		}
+		w.WriteHeader(200)
+	})
+	mux.HandleFunc("POST /v1.0/users/"+url.PathEscape(testMailbox)+"/messages/D1/send", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(202)
+	})
+	g := setupGraph(t, mux, nil)
+	if err := g.Send(Outgoing{ReplyTo: "MSG1", Body: "a < b\nline2"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	body := patch["body"].(map[string]any)
+	if body["content"] != "<html><head></head><body>a &lt; b<br>line2<br><div>orig</div></body></html>" {
+		t.Errorf("patched body = %q", body["content"])
 	}
 }
 

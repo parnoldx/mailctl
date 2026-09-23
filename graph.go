@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"mime"
 	"net/http"
@@ -252,15 +253,18 @@ func (g *graph) List(o ListOpts) ([]Msg, error) {
 	q.Set("$top", strconv.Itoa(limit))
 	q.Set("$orderby", "receivedDateTime desc")
 	q.Set("$select", "id,from,toRecipients,subject,receivedDateTime,bodyPreview,isRead,hasAttachments")
-	var filters []string
-	if o.Unread {
-		filters = append(filters, "isRead eq false")
-	}
-	if !o.Since.IsZero() {
-		filters = append(filters, "receivedDateTime ge "+o.Since.Format(time.RFC3339))
-	}
-	if len(filters) > 0 {
-		q.Set("$filter", strings.Join(filters, " and "))
+	// Graph rejects the query with InefficientFilter unless the $orderby
+	// property also appears in $filter, first.
+	if o.Unread || !o.Since.IsZero() {
+		since := "1900-01-01T00:00:00Z"
+		if !o.Since.IsZero() {
+			since = o.Since.Format(time.RFC3339)
+		}
+		filter := "receivedDateTime ge " + since
+		if o.Unread {
+			filter += " and isRead eq false"
+		}
+		q.Set("$filter", filter)
 	}
 	var res struct {
 		Value []gMessage `json:"value"`
@@ -319,23 +323,6 @@ func (g *graph) Get(id, saveDir string) (*Full, error) {
 	return full, nil
 }
 
-// saveAttachment writes data under dir with a sanitized basename and no path traversal.
-func saveAttachment(dir, name string, data []byte) (string, error) {
-	base := filepath.Base(name)
-	if base == "." || base == ".." || base == string(filepath.Separator) || base == "" {
-		base = "attachment"
-	}
-	path := filepath.Join(dir, base)
-	for i := 1; ; i++ {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			break
-		}
-		ext := filepath.Ext(base)
-		path = filepath.Join(dir, fmt.Sprintf("%s-%d%s", strings.TrimSuffix(base, ext), i, ext))
-	}
-	return path, os.WriteFile(path, data, 0o600)
-}
-
 func recips(addrs []string) []gRecip {
 	out := make([]gRecip, 0, len(addrs))
 	for _, a := range addrs {
@@ -379,11 +366,29 @@ func (g *graph) Send(o Outgoing) error {
 		if draft.Body != nil {
 			existing, ct = draft.Body.Content, draft.Body.ContentType
 		}
-		sep := "\n"
+		var content string
 		if ct == "HTML" {
-			sep = "<br>"
+			reply := o.Body
+			if !o.HTML {
+				// The draft is HTML, the reply is plain text: escape it and keep line breaks.
+				reply = strings.ReplaceAll(html.EscapeString(o.Body), "\n", "<br>")
+			}
+			// Insert after the opening <body> tag; prepend if there is none.
+			low := strings.ToLower(existing)
+			if i := strings.Index(low, "<body"); i >= 0 {
+				if j := strings.IndexByte(low[i:], '>'); j >= 0 {
+					pos := i + j + 1
+					content = existing[:pos] + reply + "<br>" + existing[pos:]
+				} else {
+					content = reply + "<br>" + existing
+				}
+			} else {
+				content = reply + "<br>" + existing
+			}
+		} else {
+			content = o.Body + "\n\n" + existing
 		}
-		patch := gPatchMessage{Body: &gBody{ContentType: ct, Content: o.Body + sep + existing}}
+		patch := gPatchMessage{Body: &gBody{ContentType: ct, Content: content}}
 		if len(o.To) > 0 {
 			patch.ToRecipients = recips(o.To)
 		}

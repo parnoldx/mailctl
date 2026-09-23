@@ -1,6 +1,12 @@
 package main
 
-import "time"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
 
 // Msg is a message summary as returned by List.
 type Msg struct {
@@ -56,4 +62,25 @@ type Mailbox interface {
 	Send(Outgoing) error
 	Mark(id string, read bool) error
 	Move(id, folder string) error
+}
+
+// saveAttachment writes data under dir with a sanitized basename and no path
+// traversal, creating dir if needed. Existing files are never overwritten.
+func saveAttachment(dir, name string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create %s: %w", dir, err)
+	}
+	base := filepath.Base(name)
+	if base == "." || base == ".." || base == string(filepath.Separator) || base == "" {
+		base = "attachment"
+	}
+	path := filepath.Join(dir, base)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			break
+		}
+		ext := filepath.Ext(base)
+		path = filepath.Join(dir, fmt.Sprintf("%s-%d%s", strings.TrimSuffix(base, ext), i, ext))
+	}
+	return path, os.WriteFile(path, data, 0o600)
 }

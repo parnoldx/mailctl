@@ -18,7 +18,6 @@ type Account struct {
 	Type        string `toml:"type"` // "imap" | "graph"
 	Description string `toml:"description"`
 	// imap
-	// imap
 	IMAP        string `toml:"imap"`
 	SMTP        string `toml:"smtp"`
 	User        string `toml:"user"`

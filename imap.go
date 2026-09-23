@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
@@ -293,10 +294,10 @@ type rawAttachment struct {
 }
 
 // parseMIME parses a raw RFC 5322 message via go-message/mail.
-func parseMIME(raw []byte) (headers map[string][]string, text, html string, atts []rawAttachment, err error) {
+func parseMIME(raw []byte) (hdr mail.Header, headers map[string][]string, text, html string, atts []rawAttachment, err error) {
 	r, err := mail.CreateReader(bytes.NewReader(raw))
 	if err != nil {
-		return nil, "", "", nil, fmt.Errorf("parse message: %w", err)
+		return mail.Header{}, nil, "", "", nil, fmt.Errorf("parse message: %w", err)
 	}
 	headers = map[string][]string{}
 	for fields := r.Header.Fields(); fields.Next(); {
@@ -310,11 +311,11 @@ func parseMIME(raw []byte) (headers map[string][]string, text, html string, atts
 			break
 		}
 		if err != nil {
-			return nil, "", "", nil, fmt.Errorf("parse message part: %w", err)
+			return mail.Header{}, nil, "", "", nil, fmt.Errorf("parse message part: %w", err)
 		}
 		body, err := io.ReadAll(p.Body)
 		if err != nil {
-			return nil, "", "", nil, fmt.Errorf("read message part: %w", err)
+			return mail.Header{}, nil, "", "", nil, fmt.Errorf("read message part: %w", err)
 		}
 		switch h := p.Header.(type) {
 		case *mail.AttachmentHeader:
@@ -333,76 +334,56 @@ func parseMIME(raw []byte) (headers map[string][]string, text, html string, atts
 			}
 		}
 	}
-	return headers, text, html, atts, nil
+	return r.Header, headers, text, html, atts, nil
 }
 
-// saveAttachments writes attachments to dir and sets Path on each.
-func saveAttachments(dir string, atts []rawAttachment) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
-	}
-	used := map[string]bool{}
-	for i := range atts {
-		name := filepath.Base(atts[i].Name) // never trust stored names
-		if name == "." || name == "/" || name == "" || name == ".." {
-			name = fmt.Sprintf("attachment-%d", i+1)
-		}
-		base, ext := name, ""
-		if e := filepath.Ext(name); e != "" {
-			base, ext = name[:len(name)-len(e)], e
-		}
-		for n := 2; used[name]; n++ {
-			name = fmt.Sprintf("%s-%d%s", base, n, ext)
-		}
-		used[name] = true
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, atts[i].data, 0o644); err != nil {
-			return fmt.Errorf("write attachment %s: %w", name, err)
-		}
-		atts[i].Path = path
-	}
-	return nil
-}
-
-// fetchMessage returns the raw message for an id, without marking it read.
-func (m imapMailbox) fetchMessage(id string) ([]byte, error) {
+// fetchMessage returns the raw message and its flags for an id, without
+// marking it read.
+func (m imapMailbox) fetchMessage(id string) ([]byte, []imap.Flag, error) {
 	mi, err := parseID(id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	c, err := m.dial()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { c.Logout().Wait() }()
 	if err := selectFolder(c, mi.folder, mi.validity); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var set imap.UIDSet
 	set.AddNum(imap.UID(mi.uid))
 	sec := &imap.FetchItemBodySection{Peek: true}
-	buffs, err := c.Fetch(set, &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{sec}}).Collect()
+	buffs, err := c.Fetch(set, &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{sec},
+		Flags:       true,
+	}).Collect()
 	if err != nil {
-		return nil, fmt.Errorf("imap fetch %d in %s: %w", mi.uid, mi.folder, err)
+		return nil, nil, fmt.Errorf("imap fetch %d in %s: %w", mi.uid, mi.folder, err)
 	}
 	if len(buffs) == 0 || len(buffs[0].BodySection) == 0 {
-		return nil, fmt.Errorf("imap fetch %d in %s: message not found", mi.uid, mi.folder)
+		return nil, nil, fmt.Errorf("imap fetch %d in %s: message not found", mi.uid, mi.folder)
 	}
-	return buffs[0].BodySection[0].Bytes, nil
+	return buffs[0].BodySection[0].Bytes, buffs[0].Flags, nil
 }
 
 func (m imapMailbox) Get(id, saveDir string) (*Full, error) {
-	raw, err := m.fetchMessage(id)
+	raw, flags, err := m.fetchMessage(id)
 	if err != nil {
 		return nil, err
 	}
-	headers, text, html, atts, err := parseMIME(raw)
+	hdr, headers, text, html, atts, err := parseMIME(raw)
 	if err != nil {
 		return nil, err
 	}
 	if saveDir != "" {
-		if err := saveAttachments(saveDir, atts); err != nil {
-			return nil, err
+		for i := range atts {
+			p, err := saveAttachment(saveDir, atts[i].Name, atts[i].data)
+			if err != nil {
+				return nil, err
+			}
+			atts[i].Path = p
 		}
 	}
 	full := &Full{
@@ -414,18 +395,20 @@ func (m imapMailbox) Get(id, saveDir string) (*Full, error) {
 	for i, a := range atts {
 		full.Attachments[i] = a.Attachment
 	}
-	full.Msg = Msg{ID: id}
-	if subj, err := header(headers, "Subject"); err == nil {
+	full.Msg = Msg{ID: id, Unread: !hasFlag(flags, imap.FlagSeen), HasAttachments: len(atts) > 0}
+	if subj, err := hdr.Subject(); err == nil {
 		full.Msg.Subject = subj
 	}
-	return full, nil
-}
-
-func header(headers map[string][]string, key string) (string, error) {
-	if v, ok := headers[key]; ok && len(v) > 0 {
-		return v[0], nil
+	if from, err := hdr.AddressList("From"); err == nil && len(from) > 0 {
+		full.Msg.From = from[0].Address
 	}
-	return "", fmt.Errorf("no header %s", key)
+	if to, err := hdr.AddressList("To"); err == nil {
+		full.Msg.To = addrsToStrings(to)
+	}
+	if d, err := hdr.Date(); err == nil {
+		full.Msg.Date = d
+	}
+	return full, nil
 }
 
 func (m imapMailbox) Mark(id string, read bool) error {
@@ -488,7 +471,7 @@ func (m imapMailbox) Send(o Outgoing) error {
 		refs      []string
 	)
 	if o.ReplyTo != "" {
-		raw, err := m.fetchMessage(o.ReplyTo)
+		raw, _, err := m.fetchMessage(o.ReplyTo)
 		if err != nil {
 			return err
 		}
@@ -632,28 +615,36 @@ func (m imapMailbox) Send(o Outgoing) error {
 	if err := dc.Close(); err != nil {
 		return fmt.Errorf("smtp data: %w", err)
 	}
-	if err := cli.Quit(); err != nil {
-		return fmt.Errorf("smtp quit: %w", err)
-	}
+	// The server accepted the mail at DATA close; a QUIT failure must not make
+	// the agent retry and send it twice.
+	_ = cli.Quit()
 
-	// File the same bytes in the Sent folder, marked as seen.
+	// File the same bytes in the Sent folder, marked as seen. A failure here
+	// must not fail the command: the mail was already sent, and returning an
+	// error would make the agent retry and send it twice.
 	if m.a.SentFolder != "" {
-		c, err := m.dial()
-		if err != nil {
+		if err := func() error {
+			c, err := m.dial()
+			if err != nil {
+				return err
+			}
+			defer func() { c.Logout().Wait() }()
+			sec := c.Append(m.a.SentFolder, int64(buf.Len()), &imap.AppendOptions{
+				Flags: []imap.Flag{imap.FlagSeen},
+			})
+			if _, err := sec.Write(buf.Bytes()); err != nil {
+				return err
+			}
+			if err := sec.Close(); err != nil {
+				return err
+			}
+			_, err = sec.Wait()
 			return err
-		}
-		defer func() { c.Logout().Wait() }()
-		sec := c.Append(m.a.SentFolder, int64(buf.Len()), &imap.AppendOptions{
-			Flags: []imap.Flag{imap.FlagSeen},
-		})
-		if _, err := sec.Write(buf.Bytes()); err != nil {
-			return fmt.Errorf("imap append %s: %w", m.a.SentFolder, err)
-		}
-		if err := sec.Close(); err != nil {
-			return fmt.Errorf("imap append %s: %w", m.a.SentFolder, err)
-		}
-		if _, err := sec.Wait(); err != nil {
-			return fmt.Errorf("imap append %s: %w", m.a.SentFolder, err)
+		}(); err != nil {
+			w, _ := json.Marshal(map[string]string{
+				"warning": fmt.Sprintf("sent, but saving to %s failed: %v", m.a.SentFolder, err),
+			})
+			fmt.Fprintln(os.Stderr, string(w))
 		}
 	}
 	return nil
